@@ -2,11 +2,12 @@
  | Vimeo-Upload: Upload videos to your Vimeo account directly from a
  |               browser or a Node.js app
  |
- |  ╭───╮╭─╮  
- |  │   ││ │╭─╮╭──┬──┬─╮╭───╮╭───╮   
- |  │   ││ │├─┤│ ╭╮ ╭╮ ││ ─ ││╭╮ │  ╭────────┬─────────────────────╮
- |  ╰╮  ╰╯╭╯│ ││ ││ ││ ││  ─┤│╰╯ │  | UPLOAD │ ▒▒▒▒▒▒▒▒▒▒▒░░░░ %75 | 
- |   ╰────╯ ╰─╯╰─╯╰─╯╰─╯╰───╯╰───╯  ╰────────┴─────────────────────╯                    
+ |  _    ___
+ | | |  / (_)___ ___  ___  ____
+ | | | / / / __ `__ \/ _ \/ __ \   ┌───────────────────────────┐
+ | | |/ / / / / / / /  __/ /_/ /   | ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  %75    |
+ | |___/_/_/ /_/ /_/\___/\____/    └───────────────────────────┘
+ |                      Upload
  |
  |
  | This project was released under Apache 2.0" license.
@@ -41,7 +42,7 @@
      */
     var RetryHandler = function() {
         this.interval = 1000 // Start at one second
-        this.maxInterval = 60 * 1000; // Don't wait longer than a minute
+        this.maxInterval = 120 * 1000; // Don't wait longer than two minutes
     }
 
     /**
@@ -111,9 +112,11 @@
         description: 'Default description',
         contentType: 'application/octet-stream',
         token: null,
+        videoid: '',
         file: {},
         metadata: [],
-        upgrade_to_1080: false,
+        upgrade_to_1080: true,
+        collection: '',
         offset: 0,
         chunkSize: 0,
         retryHandler: new RetryHandler(),
@@ -160,8 +163,8 @@
 
         this.videoData = {
             name: (opts.name > '') ? opts.name : defaults.name,
-            description: (opts.description > '') ? opts.description : defaults.description,
-            'privacy.view': opts.private ? 'nobody' : 'anybody'
+            description: (opts.description > '') ? opts.description : defaults.description
+            //'privacy.view': opts.private ? 'unlisted' : 'anybody'
         }
 
         if (!(this.url = opts.url)) {
@@ -193,15 +196,15 @@
         xhr.open(this.httpMethod, this.url, true)
         xhr.setRequestHeader('Authorization', 'Bearer ' + this.token)
         xhr.setRequestHeader('Content-Type', 'application/json')
+        xhr.setRequestHeader('Accept', 'application/vnd.vimeo.*+json;version=3.4')
 
         xhr.onload = function(e) {
             // get vimeo upload  url, user (for available quote), ticket id and complete url
             if (e.target.status < 400) {
                 var response = JSON.parse(e.target.responseText)
-                this.url = response.upload_link_secure
+                this.url = response.upload.upload_link
                 this.user = response.user
-                this.ticket_id = response.ticket_id
-                this.complete_url = defaults.api_url + response.complete_uri
+                this.video_id = response.uri.split('/').pop()
                 this.sendFile_()
             } else {
                 this.onUploadError_(e)
@@ -210,9 +213,38 @@
 
         xhr.onerror = this.onUploadError_.bind(this)
         xhr.send(JSON.stringify({
-            type: 'streaming',
-            upgrade_to_1080: this.upgrade_to_1080
-        }))
+            upload: {
+                approach: 'tus',
+                size: this.file.size
+            },
+            name: this.name
+        }));
+    }
+
+    /**
+     * Initiate the upload (Get vimeo ticket number and upload url)
+     */
+    me.prototype.uploadThumbnail = function() {
+        var xhr = new XMLHttpRequest()
+        xhr.open(this.httpMethod, this.api_url +'/videos/'+ this.videoid +'/pictures', true)
+        xhr.setRequestHeader('Authorization', 'Bearer ' + this.token)
+        xhr.setRequestHeader('Content-Type', 'application/json')
+
+        xhr.onload = function(e) {
+            // get vimeo upload  url, user (for available quote), ticket id and complete url
+            if (e.target.status < 400) {
+                var response = JSON.parse(e.target.responseText)
+                this.uri = response.uri
+                this.url = response.link
+
+                this.sendThumbnail_()
+            } else {
+                this.onUploadError_(e)
+            }
+        }.bind(this)
+
+        xhr.onerror = this.onUploadError_.bind(this)
+        xhr.send()
     }
 
     // -------------------------------------------------------------------------
@@ -236,15 +268,43 @@
         }
 
         var xhr = new XMLHttpRequest()
-        xhr.open('PUT', this.url, true)
-        xhr.setRequestHeader('Content-Type', this.contentType)
-            // xhr.setRequestHeader('Content-Length', this.file.size)
-        xhr.setRequestHeader('Content-Range', 'bytes ' + this.offset + '-' + (end - 1) + '/' + this.file.size)
+        xhr.open('PATCH', this.url, true)
+        xhr.setRequestHeader('Tus-Resumable', '1.0.0')
+        xhr.setRequestHeader('Content-Type', 'application/offset+octet-stream')
+        xhr.setRequestHeader('Upload-Offset', 0)
 
         if (xhr.upload) {
             xhr.upload.addEventListener('progress', this.onProgress)
         }
         xhr.onload = this.onContentUploadSuccess_.bind(this)
+        xhr.onerror = this.onContentUploadError_.bind(this)
+        xhr.send(content)
+    }
+
+    /**
+     * Send the actual file content.
+     *
+     * @private
+     */
+    me.prototype.sendThumbnail_ = function() {
+        var content = this.file
+        var end = this.file.size
+
+        if (this.offset || this.chunkSize) {
+            // Only bother to slice the file if we're either resuming or uploading in chunks
+            if (this.chunkSize) {
+                end = Math.min(this.offset + this.chunkSize, this.file.size)
+            }
+            content = content.slice(this.offset, end)
+        }
+
+        var xhr = new XMLHttpRequest()
+        xhr.open('PUT', this.url, true)
+
+        if (xhr.upload) {
+            xhr.upload.addEventListener('progress', this.onProgress)
+        }
+        xhr.onload = this.onThumbnailUploadSuccess_.bind(this)
         xhr.onerror = this.onContentUploadError_.bind(this)
         xhr.send(content)
     }
@@ -287,29 +347,38 @@
      *
      * @private
      */
-    me.prototype.complete_ = function(xhr) {
-        var xhr = new XMLHttpRequest()
-        xhr.open('DELETE', this.complete_url, true)
-        xhr.setRequestHeader('Authorization', 'Bearer ' + this.token)
+     me.prototype.complete_ = function (xhr) {
 
-        xhr.onload = function(e) {
+         var xhr = new XMLHttpRequest()
+         xhr.open('HEAD', this.url, true)
+         xhr.setRequestHeader('Tus-Resumable', '1.0.0')
+         xhr.setRequestHeader('Accept', 'application/vnd.vimeo.*+json;version=3.4')
 
-            // Get the video location (videoId)
-            if (e.target.status < 400) {
-                var location = e.target.getResponseHeader('Location')
+         xhr.onload = function (e) {
 
-                // Example of location: ' /videos/115365719', extract the video id only
-                var video_id = location.split('/').pop()
-                    // Update the video metadata
-                this.onUpdateVideoData_(video_id)
-            } else {
-                this.onCompleteError_(e)
-            }
-        }.bind(this)
+             if (e.target.status < 400) {
+                 var uploadLength = e.target.getResponseHeader('Upload-Length')
+                 var uploadOffset = e.target.getResponseHeader('Upload-Offset')
+                 if (uploadLength === uploadOffset) {
+                     // Ready!
+                     this.onComplete(this.video_id)
+                 } else {
+                     this.onError(e)
+                 }
 
-        xhr.onerror = this.onCompleteError_.bind(this)
-        xhr.send()
-    }
+                 // Set collectin if album_id exist
+                 if (this.collection) {
+                     this.onUpdateVideoCollection_(this.video_id);
+                 }
+             } else {
+                 this.onError(e)
+             }
+
+         }.bind(this)
+
+         xhr.onerror = this.onCompleteError_.bind(this)
+         xhr.send()
+     }
 
     /**
      * Update the Video Data and add the metadata to the upload object
@@ -329,6 +398,22 @@
             this.onGetMetadata_(e, video_id)
         }.bind(this)
         xhr.send(this.buildQuery_(this.videoData))
+    }
+
+    /**
+     * Update the Video Collection
+     *
+     * @private
+     * @param {string} [id] Video Id
+     */
+    me.prototype.onUpdateVideoCollection_ = function(video_id) {
+        var url = this.buildUrl_(video_id, [], defaults.api_url + '/me/albums/'+ this.collection +'/videos/')
+        var httpMethod = 'PUT'
+        var xhr = new XMLHttpRequest()
+
+        xhr.open(httpMethod, url, true)
+        xhr.setRequestHeader('Authorization', 'Bearer ' + this.token)
+        xhr.send()
     }
 
     /**
@@ -366,12 +451,41 @@
      * @param {object} e XHR event
      */
     me.prototype.onContentUploadSuccess_ = function(e) {
-        if (e.target.status == 200 || e.target.status == 201) {
+        if (e.target.status == 200 || e.target.status == 201 || e.target.status == 204) {
             this.complete_()
         } else if (e.target.status == 308) {
             this.extractRange_(e.target)
             this.retryHandler.reset()
             this.sendFile_()
+        }
+    }
+
+    /**
+     * Handle successful responses for thumbnail uploads. Depending on the context,
+     * may continue with uploading the next chunk of the file or, if complete,
+     * invokes vimeo complete service.
+     *
+     * @private
+     * @param {object} e XHR event
+     */
+    me.prototype.onThumbnailUploadSuccess_ = function(e) {
+        if (e.target.status == 200 || e.target.status == 201) {
+            var url = defaults.api_url + this.uri
+            var httpMethod = 'PATCH'
+            var xhr = new XMLHttpRequest()
+
+            xhr.open(httpMethod, url, true)
+            xhr.setRequestHeader('Authorization', 'Bearer ' + this.token)
+            xhr.setRequestHeader('Content-Type', 'application/json')
+            xhr.send(JSON.stringify({
+                active: true
+            }))
+
+            this.onComplete()
+        } else if (e.target.status == 308) {
+            this.extractRange_(e.target)
+            this.retryHandler.reset()
+            this.sendThumbnail_()
         }
     }
 
